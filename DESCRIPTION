@@ -1,0 +1,42 @@
+Package: latents
+Title: Multilevel Latent Profile, Class and Transition Models
+Version: 0.9.21
+Authors@R: c(
+    person("Mohammed", "Saqr", , "saqr@saqr.me", role = c("aut", "cre", "cph"),
+           comment = c(ORCID = "0000-0001-5881-3109")),
+    person("Sonsoles", "L\u00f3pez-Pernas", role = "aut",
+           comment = c(ORCID = "0000-0002-9621-1392")))
+Description: Provides functions for fitting multilevel latent profile
+    analysis, latent class, and latent transition models for continuous,
+    categorical, and mixed-type variables. Models are estimated by expectation-maximization,
+    handle missing data, and provide standard and robust standard errors.
+    Model selection is supported by information criteria, entropy,
+    classification diagnostics, and a parametric bootstrap likelihood ratio
+    test. Covariates can be related to latent class membership using
+    three-step methods with correction for classification error. Latent
+    transition models estimate transitions between latent profiles across
+    ordered occasions and are compatible with the 'tna' package for network
+    and sequence analysis. The multilevel mixture formulation follows Vermunt
+    (2003) <doi:10.1111/j.0081-1750.2003.t01-1-00131.x>.
+URL: https://pak.dynasite.org/latents/,
+        https://github.com/mohsaqr/latents
+BugReports: https://github.com/mohsaqr/latents/issues
+License: GPL-3
+Encoding: UTF-8
+Depends: R (>= 4.1.0)
+Imports: stats, graphics, grDevices, utils
+Suggests: testthat (>= 3.0.0), knitr, rmarkdown, tna, mclust, mice,
+        ggplot2, MASS, withr
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+RoxygenNote: 7.3.3
+LazyData: true
+NeedsCompilation: no
+Packaged: 2026-10-06 06:56:56 UTC; mohammedsaqr
+Author: Mohammed Saqr [aut, cre, cph] (ORCID:
+    <https://orcid.org/0000-0001-5881-3109>),
+  Sonsoles López-Pernas [aut] (ORCID:
+    <https://orcid.org/0000-0002-9621-1392>)
+Maintainer: Mohammed Saqr <saqr@saqr.me>
+Repository: CRAN
+Date/Publication: 2026-10-16 09:20:18 UTC

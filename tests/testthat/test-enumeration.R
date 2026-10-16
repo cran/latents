@@ -1,0 +1,349 @@
+test_that("enumeration retains failures and both BIC conventions", {
+  set.seed(12)
+  d <- data.frame(g = rep(1:30, each = 10), y = c(rnorm(150, -2), rnorm(150, 2)))
+  result <- enumerate_classes(d, "y", "g", n_profiles = 1:2, n_group_classes = 1:2,
+                             model = NULL, n_starts = 1, seed = 12)
+  grid <- as.data.frame(result)
+  expect_equal(nrow(grid), 4L)
+  expect_match(grid$error[3], "profile")
+  expect_error(candidate_fit(result, n_profiles = 1, n_group_classes = 2),
+               class = "latents_failed_candidate")
+  # Every criterion the grid names must actually carry numbers. `aic` was
+  # silently an all-missing column named `NA.`, so a finiteness assertion on
+  # `grid$aic` passed vacuously against a column that did not exist.
+  expect_true("aic" %in% names(grid))
+  expect_true(all(is.finite(grid$aic[c(1, 2, 4)])))
+  expect_true(all(c("kic", "clc_groups", "clc_individual") %in% names(grid)))
+  one_profile <- candidate_fit(result, n_profiles = 1, n_group_classes = 1)
+  expect_equal(grid$bic_groups[1], one_profile$bic)
+  expect_equal(grid$bic_individual[1], one_profile$bic_individual)
+  expect_true(is.na(grid$profile_entropy[1]))
+  expect_gt(grid$profile_entropy[2], 0)
+  expect_lte(grid$profile_entropy[2], 1)
+  expect_error(enumerate_classes(d, "y", "g", n_profiles = 0, n_starts = 1), "n_profiles")
+  # `n_profiles` names the grid here and the count everywhere else, so a single
+  # value is a one-row grid rather than the error the old `profiles =` spelling
+  # had to raise when the same word arrived through `...`.
+  single <- enumerate_classes(d, "y", "g", n_profiles = 2, n_group_classes = 1,
+                              model = "VVI", n_starts = 1, seed = 1)
+  expect_equal(nrow(as.data.frame(single)), 1L)
+  # A name multilpa() does not take is refused before any candidate is fitted,
+  # so the refusal is visible at once instead of as a grid of failed fits.
+  expect_error(enumerate_classes(d, "y", "g", n_profiles = 2, n_group_classes = 1,
+                                 nonsense = 1, seed = 1, n_starts = 1),
+               class = "latents_bad_argument")
+})
+
+test_that("simulation preserves group layout and full covariance moments", {
+  set.seed(9)
+  noise <- matrix(rnorm(2000), 1000, 2) %*% chol(matrix(c(1, .6, .6, 2), 2))
+  d <- data.frame(g = rep(1:100, each = 10), a = noise[, 1], b = noise[, 2])
+  model <- multilpa(d, c("a", "b"), "g", 1, 1, covariance_model = "full", n_starts = 1)
+  simulated <- .multilpa_simulate(model)
+  expect_identical(simulated$g, d$g)
+  expect_identical(names(simulated), c("a", "b", "g"))
+  expect_equal(cov(simulated[c("a", "b")]), cov(d[c("a", "b")]), tolerance = .2)
+  expect_false(anyNA(simulated))
+  one <- multilpa(d, "a", "g", 1, 1, covariance_model = "full", n_starts = 1)
+  single_indicator <- .multilpa_simulate(one)
+  expect_equal(dim(single_indicator), c(1000L, 2L))
+  expect_identical(single_indicator$g, d$g)
+  expect_equal(mean(single_indicator$a), mean(d$a), tolerance = .1)
+})
+
+test_that("simulation preserves categorical types and declared factor order", {
+  set.seed(7)
+  data <- data.frame(
+    g = rep(seq_len(20L), each = 5L),
+    y = stats::rnorm(100L),
+    category = ordered(rep(c("10", "2"), 50L), levels = c("10", "2")),
+    rating = rep(c(10L, 2L), each = 50L))
+  fit <- quietly(multilpa(data, c("y", "category", "rating"), "g", 2L, 1L,
+                           categorical = c("category", "rating"),
+                           n_starts = 1, max_iter = 80L, seed = 1L))
+  simulated <- .multilpa_simulate(fit)
+  expect_identical(class(simulated$category), c("ordered", "factor"))
+  expect_identical(levels(simulated$category), c("10", "2"))
+  expect_type(simulated$rating, "integer")
+  expect_identical(names(simulated), c("y", "category", "rating", "g"))
+  encoded <- .multilpa_encode_categorical(
+    simulated[c("category", "rating")])
+  expect_identical(encoded$levels$category, fit$categorical_levels$category)
+  expect_identical(encoded$levels$rating, fit$categorical_levels$rating)
+})
+
+test_that("bootstrap withholds p-values if a replicate cannot be fitted", {
+  set.seed(53)
+  d <- data.frame(g = rep(1:20, each = 5), y = c(rnorm(50, -2), rnorm(50, 2)))
+  small <- multilpa(d, "y", "g", 1, 1, n_starts = 2, seed = 12)
+  large <- multilpa(d, "y", "g", 2, 1, n_starts = 2, seed = 12)
+  testthat::local_mocked_bindings(multilpa = function(...) stop("test optimization failure"))
+  expect_warning(result <- bootstrap_lrt(small, large, d, iter = 2, seed = 1),
+                 class = "latents_failed_replicates")
+  expect_s3_class(result, "multilpa_bootstrap_lrt")
+  ## Methods added in this sweep reach the generic only after the NAMESPACE is
+  ## regenerated, so they are exercised by explicit call here. Dispatch itself
+  ## is asserted in test-tidy-classes.R.
+  test <- get_results(result, "test")
+  expect_identical(nrow(test), 1L)
+  expect_true(is.na(test$p_value))
+  expect_equal(test$n_valid, 0L)
+  replicates <- get_results(result, "replicates")
+  expect_true(all(replicates$error == "test optimization failure"))
+  expect_error(plot.multilpa_bootstrap_lrt(result),
+               class = "latents_nothing_to_plot")
+})
+
+test_that("bootstrap refits generated data and reports finite simulation correction", {
+  set.seed(53)
+  d <- data.frame(g = rep(1:30, each = 8), y = rnorm(240))
+  small <- multilpa(d, "y", "g", 1, 1, variance_model = "equal", n_starts = 1, seed = 8)
+  large <- multilpa(d, "y", "g", 2, 1, variance_model = "equal", n_starts = 1, seed = 8,
+                      max_iter = 3000, tol = 1e-7)
+  rng <- .Random.seed
+  result <- bootstrap_lrt(small, large, d, iter = 3, n_starts = 1,
+                                  max_iter = 3000, tol = 1e-7, seed = 42)
+  expect_identical(.Random.seed, rng)
+  test <- get_results(result, "test")
+  replicates <- get_results(result, "replicates")
+  expect_identical(nrow(test), 1L)
+  expect_equal(test$n_valid, 3L)
+  expect_equal(test$statistic, max(0, 2 * (large$log_likelihood - small$log_likelihood)))
+  expect_equal(test$p_value, (1 + sum(replicates$statistic >= test$statistic)) / 4)
+  expect_equal(nrow(replicates), 3L)
+  expect_true(all(is.na(replicates$error)))
+  expect_true(is.finite(test$monte_carlo_se))
+  expect_output(print.multilpa_bootstrap_lrt(result), "Parametric bootstrap")
+  expect_output(print.summary_multilpa_bootstrap_lrt(
+    summary.multilpa_bootstrap_lrt(result)), "simulated, not chi-square")
+  expect_error(bootstrap_lrt(small, small, d, iter = 2), "one class")
+  changed <- d
+  changed$y <- d$y + 1
+  expect_error(bootstrap_lrt(small, large, changed, iter = 2), "reproduce")
+  changed$y[1] <- NA_real_
+  # Missing values are refused unless both fits integrated them out.
+  expect_error(bootstrap_lrt(small, large, changed, iter = 2),
+               class = "latents_bad_data")
+})
+
+test_that("full covariance print and summary expose residual matrices", {
+  set.seed(3)
+  d <- data.frame(g = rep(1:10, each = 10), a = rnorm(100), b = rnorm(100))
+  fit <- multilpa(d, c("a", "b"), "g", 1, 1, covariance_model = "full", n_starts = 1)
+  expect_output(print(fit), "full residual covariance")
+  expect_equal(summary(fit)$covariances, fit$covariances)
+  expect_output(print(summary(fit)), "-- covariances", fixed = TRUE)
+})
+
+test_that("boundary convergence noise is not mistaken for a reversed likelihood", {
+  skip_on_cran()
+  vars <- c("browse", "lectures", "forum_read", "forum_post", "attendance")
+  null_fit <- multilpa(engagement_small, vars, "student", n_profiles = 2,
+                       n_group_classes = 1, n_starts = 1, seed = 1, tol = 1e-8)
+  alt_fit <- multilpa(engagement_small, vars, "student", n_profiles = 2,
+                      n_group_classes = 2, n_starts = 1, seed = 1, tol = 1e-8)
+  # Under the null the alternative converges to the null solution, so every
+  # replicate statistic sits at zero plus EM noise. EM stops on a RELATIVE
+  # change, so that noise is about `2 * tol * |log_likelihood|`, which on a
+  # likelihood of this size is several times the fixed -1e-5 window this check
+  # used to apply. The result was
+  # that healthy replicates were reported as "Nonconvergence or reversed
+  # likelihood" and a perfectly ordinary comparison withheld its p-value.
+  # A replicate refit on simulated data can land a small class; that warning is
+  # recorded in the replicate table and also propagates, so muffle just it.
+  # Eight replicates rather than the twelve this test used on the smaller
+  # bundled dataset it was written against: each replicate now refits 1422
+  # observations on five indicators. The claim is that EVERY replicate is
+  # valid, and eight carry it as well as twelve did.
+  result <- quietly(bootstrap_lrt(null_fit, alt_fit, iter = 8, n_starts = 1,
+                                  max_iter = 2000, tol = 1e-8, seed = 7))
+  test <- get_results(result, "test")
+  expect_identical(test$n_valid, 8L)
+  expect_false(is.na(test$p_value))
+
+  replicates <- get_results(result, "replicates")
+  expect_true(all(replicates$valid))
+  expect_true(all(is.na(replicates$error)))
+  # A replicate that raised nothing reports NA, not an empty string sitting
+  # beside an NA-valued error column. Some replicates legitimately do warn, so
+  # the contract is "never empty", not "always absent".
+  expect_false(any(!is.na(replicates$warnings) & !nzchar(replicates$warnings)))
+
+  # An unconverged model is refused before any statistic is formed, by class.
+  # This guard fires ahead of the reversed-likelihood one, and correctly so: a
+  # reversal means the alternative was badly optimised, which is what this
+  # catches. That ordering makes `latents_reversed_likelihood` hard to reach
+  # from here, so it is not asserted in this test.
+  poor_start <- list(means = matrix(rep(c(0, 1), each = length(vars)),
+                                    nrow = 2, byrow = TRUE),
+                     variances = matrix(1, 2, length(vars)),
+                     profile_probabilities = matrix(0.5, 2, 2),
+                     group_probabilities = c(0.5, 0.5))
+  unconverged <- quietly(multilpa(engagement_small, vars, "student",
+                                  n_profiles = 2, n_group_classes = 2,
+                                  n_starts = 1, seed = 1, max_iter = 0,
+                                  start = poor_start, tol = 1e-8))
+  expect_error(bootstrap_lrt(null_fit, unconverged, iter = 2, n_starts = 1,
+                             seed = 1),
+               class = "latents_no_converge")
+})
+
+test_that("covariance models are named with `model`, and a stray argument is refused", {
+  grid <- quietly(enumerate_classes(engagement_small, c("browse", "lectures"),
+                                    "student", n_profiles = 2, n_group_classes = 1,
+                                    model = c("VVI", "EEI"), n_starts = 1,
+                                    max_iter = 20, seed = 1))
+  table <- as.data.frame(grid)
+  expect_identical(sort(table$model), c("EEI", "VVI"))
+  expect_s3_class(candidate_fit(grid, n_profiles = 2, n_group_classes = 1,
+                                model = "EEI"), "multilpa")
+  expect_true("model" %in% names(get_results(grid, "criteria")))
+  # The old name would otherwise fail inside every candidate.
+  expect_error(enumerate_classes(engagement_small, "browse", "student",
+                                 n_profiles = 2, n_group_classes = 1,
+                                 structure = "VVI", n_starts = 1),
+               class = "latents_bad_argument")
+  expect_error(enumerate_classes(engagement_small, "browse", "student",
+                                 n_profiles = 2, n_group_classes = 1,
+                                 structure = "VVI", n_starts = 1),
+               "`model`")
+})
+
+test_that("printing a grid shows the criteria and the diagnostics", {
+  grid <- quietly(enumerate_classes(engagement_small, c("browse", "lectures"),
+                                    "student", n_profiles = 1:2,
+                                    n_group_classes = 1:2, n_starts = 1,
+                                    max_iter = 20, seed = 1))
+  printed <- paste(utils::capture.output(print(grid)), collapse = "\n")
+  invisible(lapply(c("aic", "bic_groups", "bic_individual", "icl_individual",
+                     "group_entropy", "boundary", "n_best_replicated"),
+                   function(column) expect_match(printed, column, fixed = TRUE)))
+})
+
+test_that("the enumeration plot draws several criteria as panels or plots", {
+  skip_on_cran()
+  skip_if_not_installed("ggplot2")
+  grid <- quietly(enumerate_classes(engagement_small, c("browse", "lectures"),
+                                    "student", n_profiles = 1:3,
+                                    n_group_classes = 1:2, n_starts = 1,
+                                    max_iter = 20, seed = 1))
+  combined <- expect_plot(plot(grid))
+  # One panel per distinct criterion.
+  expect_identical(levels(combined$data$title),
+                   names(.multilpa_distinct_criteria(
+                     as.data.frame(grid),
+                     c("aic", "bic_groups", "bic_individual", "icl_individual"))))
+  expect_plot(plot(grid, criterion = "bic_groups"))
+  expect_plot(plot(grid, criterion = c("aic", "bic_individual")))
+  # Separate plots: one per criterion.
+  separate <- expect_plots(plot(grid, criterion = c("aic", "bic_groups"),
+                                combine = FALSE))
+  expect_length(separate, 2L)
+  expect_plot(plot(grid, what = "tree"))
+  expect_error(plot(grid, combine = NA))
+  expect_error(plot(grid, criterion = c("aic", "not_a_criterion")),
+               class = "latents_unknown_criterion")
+})
+
+test_that("enumerate_classes() enumerates single-level models with id = NULL", {
+  flowers <- stats::setNames(iris[1:4], c("sl", "sw", "pl", "pw"))
+  # The two-level verb says what it fitted and which verbs fit it by name.
+  expect_message(
+    grid <- enumerate_classes(flowers, names(flowers), id = NULL,
+                              n_profiles = 1:3, model = c("VVV", "EEE"),
+                              n_starts = 1, seed = 1),
+    class = "latents_single_level")
+  # Leaving `id` out is refused and points to the single-level verbs.
+  expect_error(enumerate_classes(flowers, names(flowers), n_profiles = 1:2, n_starts = 1),
+               class = "latents_bad_argument")
+  table <- as.data.frame(grid)
+  expect_identical(nrow(table), 6L)
+  expect_true(all(table$n_group_classes == 1L))
+  expect_true(all(is.na(table$error)))
+  # The single-level notice is given once, not recorded against every row.
+  expect_false(any(grepl("single-level", table$warnings)))
+  # Each cell is the fit multilpa() makes on its own.
+  alone <- withCallingHandlers(
+    multilpa(flowers, names(flowers), id = NULL, n_profiles = 3, n_starts = 1,
+             seed = 1, volume = "varying", shape = "varying",
+             orientation = "varying"),
+    latents_single_level = function(w) invokeRestart("muffleMessage"))
+  expect_equal(candidate_fit(grid, n_profiles = 3, n_group_classes = 1,
+                             model = "VVV")$log_likelihood,
+               alone$log_likelihood)
+  expect_error(enumerate_classes(flowers, names(flowers), id = NULL,
+                                 n_profiles = 1:2, n_group_classes = 1:2, n_starts = 1),
+               class = "latents_bad_argument")
+})
+
+test_that("`model` takes the basic set by default, all 14, or codes", {
+  flowers <- stats::setNames(iris[1:4], c("sl", "sw", "pl", "pw"))
+  enumerate <- function(...) {
+    suppressMessages(enumerate_classes(flowers, names(flowers), id = NULL,
+                                       n_profiles = 1:2, n_starts = 1,
+                                       seed = 1, ...))
+  }
+  basic <- as.data.frame(enumerate())
+  # Equal or varying variances, crossed with covariances absent or present.
+  expect_identical(unique(basic$model), c("EEI", "VVI", "EEE", "VVV"))
+  expect_identical(nrow(basic), 8L)
+  # The default is the set named "basic", not a separate path.
+  expect_equal(as.data.frame(enumerate(model = "basic"))$log_likelihood,
+               basic$log_likelihood)
+  # Codes still work, and a set combines with codes without duplicates.
+  expect_identical(unique(as.data.frame(enumerate(model = "VEV"))$model), "VEV")
+  expect_identical(unique(as.data.frame(enumerate(model = c("basic", "EEE",
+                                                             "VEV")))$model),
+                   c("EEI", "VVI", "EEE", "VVV", "VEV"))
+  # NULL crosses nothing and fits what multilpa() fits by default.
+  plain <- as.data.frame(enumerate(model = NULL))
+  expect_identical(nrow(plain), 2L)
+  default_fit <- lpa(flowers, names(flowers), n_profiles = 2, n_starts = 1,
+                     seed = 1)
+  expect_identical(unique(plain$model), default_fit$covariance_structure)
+  expect_error(enumerate(model = "most"), class = "latents_bad_argument")
+})
+
+test_that("`model = \"all\"` fits the 14 structures", {
+  flowers <- stats::setNames(iris[1:4], c("sl", "sw", "pl", "pw"))
+  grid <- suppressMessages(enumerate_classes(flowers, names(flowers),
+    id = NULL, n_profiles = 2, model = "all", n_starts = 1, seed = 1))
+  expect_setequal(as.data.frame(grid)$model, latents:::.multilpa_structures())
+})
+
+test_that("structures the data cannot distinguish are fitted once", {
+  set.seed(3)
+  one <- data.frame(y = c(rnorm(50), rnorm(50, 3, 2)))
+  # One indicator: only equal or varying variance remains.
+  grid <- suppressMessages(enumerate_classes(one, "y", id = NULL,
+    n_profiles = 2, n_starts = 1, seed = 1))
+  expect_identical(as.data.frame(grid)$model, c("EEI", "VVI"))
+  grid_all <- suppressMessages(enumerate_classes(one, "y", id = NULL,
+    n_profiles = 2, model = "all", n_starts = 1, seed = 1))
+  expect_identical(nrow(as.data.frame(grid_all)), 2L)
+  # Only categorical indicators: no structure, one candidate per count, and
+  # candidate_fit() needs no `model`.
+  answers <- data.frame(a = factor(sample(c("x", "y"), 100, TRUE)),
+                        b = factor(sample(c("x", "y"), 100, TRUE)))
+  classes <- suppressMessages(enumerate_classes(answers, c("a", "b"),
+    id = NULL, n_profiles = 1:2, categorical = c("a", "b"), n_starts = 1,
+    seed = 1))
+  expect_identical(nrow(as.data.frame(classes)), 2L)
+  expect_s3_class(candidate_fit(classes, n_profiles = 2), "multilpa")
+  expect_error(enumerate_classes(answers, c("a", "b"), id = NULL,
+                                 n_profiles = 1:2, model = "basic",
+                                 categorical = c("a", "b"), n_starts = 1),
+               class = "latents_bad_argument")
+})
+
+test_that("a structure set another way replaces the basic set", {
+  flowers <- stats::setNames(iris[1:4], c("sl", "sw", "pl", "pw"))
+  grid <- suppressMessages(enumerate_classes(flowers, names(flowers),
+    id = NULL, n_profiles = 1:2, covariance_model = "full", n_starts = 1,
+    seed = 1))
+  expect_identical(nrow(as.data.frame(grid)), 2L)
+  expect_error(enumerate_classes(flowers, names(flowers), id = NULL,
+                                 n_profiles = 1:2, model = "EEE",
+                                 covariance_model = "full", n_starts = 1),
+               class = "latents_bad_argument")
+})

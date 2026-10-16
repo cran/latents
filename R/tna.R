@@ -1,0 +1,285 @@
+# Handing a fitted transition model to the tna package.
+#
+# `lta()` estimates exactly what a transition network is: a square
+# matrix of probabilities over the same states, and where the sequences start.
+# tna builds its models from those two things, so the handover is the estimates
+# themselves rather than a re-analysis of the assignments.
+#
+# That is the difference worth keeping. tna's own method for a fitted mixture
+# model, `group_model.mhmm()`, takes the model's *grouping* and counts
+# transitions between modal assignments, discarding the model's estimated
+# matrices. Here the estimates are what is handed over: they are maximised over
+# the full posteriors, so an observation split 0.6/0.4 between two profiles
+# contributes to both, where a modal count gives it entirely to one.
+
+#' A transition network for the whole sample
+#'
+#' Builds one [tna::tna()] model from a fitted transition model, aggregated
+#' over every latent group class.
+#'
+#' The aggregate is formed from the expected transition counts, summed across
+#' classes and then normalised, rather than by averaging the class transition
+#' matrices. The two differ: averaging weights each class by how probable it is,
+#' and summing counts weights it by how much transition mass it actually
+#' contributes, which is what a marginal transition probability means. A class
+#' holding a tenth of the students but a fifth of the observed moves counts for
+#' the latter. If a profile has no expected outgoing moves in any class, its
+#' transition row has no count-based estimate; the network uses the fitted
+#' class rows averaged by class probability and warns that the row is
+#' unestimated. It never interprets absent moves as a certain self-transition.
+#'
+#' @param x A fitted model from [lta()].
+#' @param ... Passed to [tna::tna()].
+#' @return An object of class `tna`, as [tna::tna()] returns: every verb of that
+#'   package applies to it, including `centralities()`, `communities()`,
+#'   `cliques()` and `plot()`.
+#' @seealso [get_group_tna()] for one network per latent class.
+#' @examples
+#' if (requireNamespace("tna", quietly = TRUE)) {
+#'   activity <- c("browse", "lectures", "forum_read")
+#'   moves <- lta(course_engagement, vars = activity, id = "student",
+#'                            time = "sequence", n_profiles = 2,
+#'                            n_group_classes = 2, n_starts = 2, seed = 1)
+#'   get_tna(moves)
+#' }
+#' @export
+get_tna <- function(x, ...) {
+  UseMethod("get_tna")
+}
+
+#' @rdname get_tna
+#' @export
+get_tna.multilpa_transitions <- function(x, ...) {
+  .multilpa_require_tna()
+  aggregate <- .multilpa_aggregate_transitions(x)
+  if (any(!aggregate$estimated)) {
+    .multilpa_warn_tna_empty_rows()
+  }
+  tna::tna(aggregate$probabilities, inits = aggregate$initial, ...)
+}
+
+#' A transition network for each latent group class
+#'
+#' Builds one [tna::tna()] model per latent group class of a fitted transition
+#' model, collected into the `group_tna` object tna's grouped verbs expect.
+#' A class row with no expected outgoing moves keeps the fit's unestimated
+#' transition probabilities and raises `latents_empty_transition_row`.
+#'
+#' @param x A fitted model from [lta()], or a [multilpa()] / [multilca()] fit
+#'   made with `time =`, whose modal profile sequences are then used.
+#' @param label What the classes are called in tna's output.
+#' @param ... Passed to [tna::tna()] for each class.
+#' @return An object of class `group_tna`, one `tna` model per latent class:
+#'   `centralities()` returns one tidy table with a `group` column,
+#'   `compare()` contrasts two classes, and `plot()` draws them together.
+#' @seealso [get_tna()] for one network over the whole sample.
+#' @examples
+#' if (requireNamespace("tna", quietly = TRUE)) {
+#'   activity <- c("browse", "lectures", "forum_read")
+#'   moves <- lta(course_engagement, vars = activity, id = "student",
+#'                            time = "sequence", n_profiles = 2,
+#'                            n_group_classes = 2, n_starts = 2, seed = 1)
+#'   get_group_tna(moves)
+#' }
+#' @export
+get_group_tna <- function(x, ...) {
+  UseMethod("get_group_tna")
+}
+
+#' @rdname get_group_tna
+#' @export
+get_group_tna.multilpa_transitions <- function(x, label = "Group class", ...) {
+  .multilpa_require_tna()
+  stopifnot("`label` must be a single string" =
+              is.character(label) && length(label) == 1L && !is.na(label))
+  if (any(x$empty_transition_rows %||% FALSE)) {
+    .multilpa_warn_tna_empty_rows()
+  }
+  states <- .multilpa_state_labels(x)
+  names <- sprintf("%s %d", label, seq_len(x$n_group_classes))
+  models <- stats::setNames(lapply(seq_len(x$n_group_classes), function(class) {
+    probabilities <- matrix(x$transition_probabilities[, , class],
+                            length(states), length(states),
+                            dimnames = list(states, states))
+    tna::tna(probabilities, inits = as.numeric(x$initial_probabilities[class, ]),
+             ...)
+  }), names)
+  .multilpa_as_group_tna(models, label = label)
+}
+
+#' @rdname get_tna
+#' @details A general [lta()] fit -- with occasion-varying or covariate-dependent
+#'   transitions, a second order, movers and stayers, or ordinal, count or
+#'   weighted data -- has no single transition matrix, and is refused with
+#'   `latents_unsupported_tna`; its transitions are in
+#'   `get_results(x, "transitions")`.
+#' @export
+get_tna.multilpa_lta <- function(x, ...) .lta_refuse_tna("get_tna()")
+
+#' @rdname get_group_tna
+#' @export
+get_group_tna.multilpa_lta <- function(x, ...) .lta_refuse_tna("get_group_tna()")
+
+#' Refuse a transition network for a general transition fit
+#' @param verb The verb, for the message.
+#' @return Never returns; raises `latents_unsupported_tna`.
+#' @noRd
+.lta_refuse_tna <- function(verb) {
+  stop(errorCondition(sprintf(paste(
+    "%s needs one transition matrix per group class, and this general",
+    "transition fit has none: its transitions vary by occasion, covariate,",
+    "previous profile or mover-stayer class, or it was fitted to ordinal,",
+    "count or weighted data. Its transitions are get_results(x,",
+    "\"transitions\")."), verb), class = "latents_unsupported_tna", call = NULL))
+}
+
+#' Warn when a network contains fitted transition rows without move data
+#' @return `NULL`, invisibly.
+#' @noRd
+.multilpa_warn_tna_empty_rows <- function() {
+  warning(warningCondition(paste(
+    "A transition row has no expected outgoing moves, so its probabilities",
+    "are not estimated from transitions. The network retains the fitted",
+    "row; inspect get_results(fit, \"transitions\", estimated = FALSE)."),
+    class = "latents_empty_transition_row", call = NULL))
+  invisible(NULL)
+}
+
+#' Is the tna package available?
+#' @return `NULL`, invisibly; raises `latents_missing_package` when it is not.
+#' @noRd
+.multilpa_require_tna <- function() {
+  if (!requireNamespace("tna", quietly = TRUE)) {
+    stop(errorCondition(paste(
+      "The tna package is needed to build a transition network.",
+      "Install it with install.packages(\"tna\")."),
+      class = "latents_missing_package", call = NULL))
+  }
+  invisible(NULL)
+}
+
+#' State labels for a transition network
+#' @param x A fitted model from [lta()].
+#' @return A character vector, one per profile.
+#' @noRd
+.multilpa_state_labels <- function(x) {
+  labels <- dimnames(x$transition_probabilities)[[1L]]
+  if (is.null(labels)) sprintf("profile_%d", seq_len(x$n_profiles)) else labels
+}
+
+#' The transition model marginal over latent group classes
+#'
+#' @param x A fitted model from [lta()].
+#' @return A list with `probabilities`, a square matrix; `initial`, the state
+#'   distribution; and `estimated`, marking rows with positive expected counts.
+#' @noRd
+.multilpa_aggregate_transitions <- function(x) {
+  states <- .multilpa_state_labels(x)
+  ## Expected counts, not probabilities: summing the counts weights each class
+  ## by the transition mass it carries, which is the marginal probability;
+  ## averaging the matrices would weight it by class size alone.
+  counts <- apply(x$transition_counts, seq_len(2L), sum)
+  totals <- rowSums(counts)
+  ## A state with no outgoing moves has no count-based transition estimate.
+  ## Keep the model's own row as a labelled fallback. A self-transition of one
+  ## would falsely turn missing transition information into evidence of staying.
+  probabilities <- counts / ifelse(totals > 0, totals, 1)
+  ## The fallback for every row at once: flattening the from x to x class
+  ## array to (from, to) x class turns the class-probability average into one
+  ## matrix product. Only the empty rows keep it.
+  n_states <- x$n_profiles
+  averaged <- matrix(matrix(x$transition_probabilities,
+                            n_states * n_states, x$n_group_classes) %*%
+                       x$group_probabilities, n_states, n_states)
+  empty <- totals <= 0
+  probabilities[empty, ] <- averaged[empty, , drop = FALSE] /
+    rowSums(averaged[empty, , drop = FALSE])
+  dimnames(probabilities) <- list(states, states)
+  initial <- as.numeric(x$group_probabilities %*% x$initial_probabilities)
+  list(probabilities = probabilities,
+       initial = stats::setNames(initial / sum(initial), states),
+       estimated = totals > 0)
+}
+
+#' Collect per-class models into tna's grouped object
+#'
+#' tna builds a `group_tna` from sequence data, so there is no public
+#' constructor for one made from estimated matrices. The object is a named list
+#' of `tna` models carrying the attributes tna's grouped verbs read; `groups`
+#' and `cols` describe the sequence data a model built from matrices does not
+#' have, and are empty rather than invented.
+#'
+#' @param models A named list of `tna` models, one per class.
+#' @param label What the classes are called.
+#' @return An object of class `group_tna`.
+#' @noRd
+.multilpa_as_group_tna <- function(models, label) {
+  structure(models,
+            groups = vector("list", length(models)),
+            label = label,
+            levels = names(models),
+            na.rm = TRUE,
+            cols = character(0L),
+            groupwise = FALSE,
+            type = "relative",
+            scaling = character(0L),
+            class = "group_tna")
+}
+
+#' @rdname get_tna
+#' @details For a [multilpa()] or [multilca()] fit made with `time =`, there is
+#'   no estimated transition matrix: the network is built by [tna::tna()] from
+#'   each group's sequence of modal profiles in time order, the observed
+#'   transitions between the profiles the observations were assigned to.
+#'   `get_group_tna()` splits those sequences by each group's modal group class.
+#'   A fit made without `time` has no order and is refused.
+#' @export
+get_tna.multilpa <- function(x, ...) {
+  .multilpa_require_tna()
+  tna::tna(.multilpa_modal_sequences(x)$states, ...)
+}
+
+#' @rdname get_tna
+#' @export
+get_tna.multilpa_covariates <- get_tna.multilpa
+
+#' @rdname get_group_tna
+#' @export
+get_group_tna.multilpa <- function(x, label = "Group class", ...) {
+  .multilpa_require_tna()
+  stopifnot("`label` must be a single string" =
+              is.character(label) && length(label) == 1L && !is.na(label))
+  sequences <- .multilpa_modal_sequences(x)
+  grouped <- cbind(sequences$states,
+                   .group = sprintf("%s %d", label, sequences$group_class))
+  tna::group_tna(grouped, group = ".group", ...)
+}
+
+#' @rdname get_group_tna
+#' @export
+get_group_tna.multilpa_covariates <- get_group_tna.multilpa
+
+#' Each group's modal profiles in time order, one row per group
+#'
+#' @param x A fitted model made with `time =`.
+#' @return A list with `states`, a data frame with one row per group and one
+#'   column per position (`T1`, `T2`, ...), holding `profile_k` labels and `NA`
+#'   after a group's last observation; and `group_class`, each group's modal
+#'   group class, in the same row order.
+#' @noRd
+.multilpa_modal_sequences <- function(x) {
+  sequences <- get_results(x, "sequences")
+  sequences <- sequences[order(sequences$group, sequences$time), , drop = FALSE]
+  groups <- factor(sequences$group, levels = unique(sequences$group))
+  by_group <- split(sprintf("profile_%d", sequences$profile), groups)
+  width <- max(lengths(by_group))
+  states <- as.data.frame(
+    do.call(rbind, lapply(by_group, function(profiles) {
+      c(profiles, rep(NA_character_, width - length(profiles)))
+    })), stringsAsFactors = FALSE)
+  names(states) <- paste0("T", seq_len(width))
+  rownames(states) <- NULL
+  first <- match(levels(groups), as.character(sequences$group))
+  stopifnot("one row per group" = nrow(states) == nlevels(groups))
+  list(states = states, group_class = sequences$group_class[first])
+}

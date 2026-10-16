@@ -1,0 +1,401 @@
+make_two_level <- function(seed = 11L, n_groups = 30L, per_group = 8L) {
+  set.seed(seed)
+  group <- rep(seq_len(n_groups), each = per_group)
+  group_class <- rep(c(1L, 2L), length.out = n_groups)
+  prevalence <- rbind(c(0.85, 0.15), c(0.2, 0.8))
+  profile <- vapply(group, function(j) {
+    sample.int(2L, 1L, prob = prevalence[group_class[j], ])
+  }, integer(1))
+  means <- rbind(c(-2, -2), c(2, 2))
+  y <- t(vapply(profile, function(k) stats::rnorm(2L, means[k, ], 1), numeric(2)))
+  data.frame(g = group, a = y[, 1L], b = y[, 2L])
+}
+
+test_that("information criteria match their documented formulas", {
+  dat <- make_two_level()
+  fit <- multilpa(dat, c("a", "b"), "g", 2, 2, n_starts = 1, seed = 5)
+  indices <- get_results(fit, "information_criteria", format = "long")
+  expect_s3_class(indices, "data.frame")
+  expect_identical(names(indices), c("criterion", "convention", "n", "value"))
+  # 3 without a convention (deviance, aic, kic) and 6 per convention
+  # (bic, sabic, caic, awe, icl, clc) at two conventions.
+  expect_identical(nrow(indices), 15L)
+  pick <- function(criterion_name, convention_name) {
+    rows <- if (is.na(convention_name)) {
+      subset(indices, criterion == criterion_name & is.na(convention))
+    } else {
+      subset(indices, criterion == criterion_name & convention == convention_name)
+    }
+    rows$value
+  }
+  q <- fit$n_parameters
+  log_likelihood <- fit$log_likelihood
+  n_individuals <- fit$n_observations
+  n_groups <- fit$n_groups
+  entropy_individuals <- .multilpa_entropy_sum(fit$subject_posteriors)
+  entropy_groups <- .multilpa_entropy_sum(fit$group_posteriors)
+  # The table reports the deviance, not the log likelihood, so that every row
+  # of `value` points the same way; logLik() still carries L itself.
+  expect_equal(pick("deviance", NA_character_), -2 * log_likelihood)
+  expect_equal(pick("aic", NA_character_), fit$aic)
+  expect_equal(pick("bic", "groups"), fit$bic)
+  expect_equal(pick("bic", "individuals"), fit$bic_individual)
+  expect_equal(pick("sabic", "individuals"),
+               -2 * log_likelihood + q * log((n_individuals + 2) / 24))
+  expect_equal(pick("sabic", "groups"),
+               -2 * log_likelihood + q * log((n_groups + 2) / 24))
+  expect_equal(pick("caic", "individuals"),
+               -2 * log_likelihood + q * (log(n_individuals) + 1))
+  expect_equal(pick("icl", "individuals"),
+               -2 * log_likelihood + q * log(n_individuals) + 2 * entropy_individuals)
+  expect_equal(pick("icl", "groups"),
+               -2 * log_likelihood + q * log(n_groups) + 2 * entropy_groups)
+  expect_equal(pick("awe", "individuals"),
+               -2 * (log_likelihood - entropy_individuals) +
+                 2 * q * (1.5 + log(n_individuals)))
+  # The deviance is the baseline the penalties are added to, so every other
+  # criterion exceeds it here. The penalty itself is not a column -- nobody
+  # reports one -- so the relation is checked against the deviance directly.
+  deviance <- subset(indices, criterion == "deviance")$value
+  expect_equal(deviance, -2 * log_likelihood)
+  expect_true(all(subset(indices, criterion != "deviance")$value > deviance))
+})
+
+test_that("information criteria order candidate models sensibly", {
+  dat <- make_two_level()
+  one <- multilpa(dat, c("a", "b"), "g", 1, 1, n_starts = 1, seed = 5)
+  two <- multilpa(dat, c("a", "b"), "g", 2, 2, n_starts = 1, seed = 5)
+  criteria <- c("bic", "sabic", "caic", "icl", "awe")
+  better <- vapply(criteria, function(criterion_name) {
+    one_value <- get_results(one, "information_criteria", format = "long")
+    two_value <- get_results(two, "information_criteria", format = "long")
+    select <- function(indices) {
+      subset(indices, criterion == criterion_name &
+               convention == "individuals")$value
+    }
+    select(two_value) < select(one_value)
+  }, logical(1))
+  # The data are generated with two well-separated profiles, so every
+  # criterion must prefer the two-profile model.
+  expect_true(all(better))
+})
+
+test_that("classification diagnostics are internally consistent", {
+  dat <- make_two_level()
+  fit <- multilpa(dat, c("a", "b"), "g", 2, 2, n_starts = 1, seed = 5)
+  summary_table <- get_results(fit, "classification", level = "both")
+  expect_identical(nrow(summary_table), 4L)
+  expect_true(all(summary_table$average_posterior >= 0 &
+                    summary_table$average_posterior <= 1))
+  individuals <- subset(summary_table, level == "individuals")
+  expect_equal(sum(individuals$n_modal), fit$n_observations)
+  expect_equal(sum(individuals$estimated_n), fit$n_observations)
+  expect_equal(sum(individuals$estimated_proportion), 1)
+  groups <- subset(summary_table, level == "groups")
+  expect_equal(sum(groups$n_modal), fit$n_groups)
+  expect_equal(sum(groups$estimated_n), fit$n_groups)
+  # Well-separated profiles must classify far better than chance.
+  expect_true(all(individuals$odds_correct_classification > 5))
+  # The cross-tabulation is its own verb now, not a flag that changes the
+  # columns of this one.
+  cross <- get_results(fit, "average_posteriors", level = "individuals")
+  expect_identical(nrow(cross), 4L)
+  # Average posteriors within each modal group are a probability distribution.
+  totals <- tapply(cross$average_posterior, cross$assigned_class, sum)
+  expect_equal(unname(as.vector(totals)), rep(1, 2))
+})
+
+test_that("classification diagnostics handle a class with no modal members", {
+  set.seed(3)
+  dat <- data.frame(g = rep(seq_len(15L), each = 6L), y = stats::rnorm(90L))
+  fit <- multilpa(dat, "y", "g", 1, 1, n_starts = 1, seed = 2)
+  table <- get_results(fit, "classification", level = "individuals")
+  expect_identical(nrow(table), 1L)
+  expect_equal(table$average_posterior, 1)
+  # A single class has proportion one, so the odds are undefined, not infinite.
+  expect_true(is.na(table$odds_correct_classification))
+})
+
+test_that("entropy is bounded and undefined for a single class", {
+  dat <- make_two_level()
+  fit <- multilpa(dat, c("a", "b"), "g", 2, 2, n_starts = 1, seed = 5)
+  entropy <- get_results(fit, "entropy")
+  expect_identical(nrow(entropy), 2L)
+  expect_true(all(entropy$relative_entropy > 0 & entropy$relative_entropy <= 1))
+  expect_true(all(entropy$entropy_sum >= 0))
+  single <- multilpa(dat, c("a", "b"), "g", 1, 1, n_starts = 1, seed = 5)
+  expect_true(all(is.na(get_results(single, "entropy")$relative_entropy)))
+  # A degenerate, perfectly separated posterior has zero entropy.
+  expect_equal(.multilpa_entropy_sum(matrix(c(1, 0, 0, 1), 2L, 2L)), 0)
+  expect_equal(.multilpa_relative_entropy(matrix(c(1, 0, 0, 1), 2L, 2L)), 1)
+  # A maximally uncertain posterior has zero relative entropy.
+  expect_equal(.multilpa_relative_entropy(matrix(0.5, 4L, 2L)), 0)
+})
+
+test_that("tidy accessors return the documented shapes", {
+  dat <- make_two_level()
+  fit <- multilpa(dat, c("a", "b"), "g", 2, 2, n_starts = 6, seed = 5)
+  profiles <- as.data.frame(fit)
+  expect_identical(names(profiles),
+    c("profile", "indicator", "mean", "variance", "standard_deviation",
+      "mean_standard_error", "variance_standard_error"))
+  expect_identical(nrow(profiles), 4L)
+  expect_equal(profiles$mean, as.vector(t(fit$means)))
+  expect_equal(profiles$standard_deviation, sqrt(profiles$variance))
+  probabilities <- get_results(fit, "profile_probabilities")
+  expect_identical(nrow(probabilities), 4L)
+  totals <- tapply(probabilities$probability, probabilities$group_class, sum)
+  expect_equal(unname(as.vector(totals)), rep(1, 2))
+  # One row per individual and profile. The wide form is still available, and
+  # carries the same numbers.
+  posteriors <- get_results(fit, "posteriors")
+  expect_identical(nrow(posteriors), fit$n_observations * fit$n_profiles)
+  expect_equal(as.vector(tapply(posteriors$posterior, posteriors$row, sum)),
+               rep(1, fit$n_observations))
+  wide <- get_results(fit, "posteriors", format = "wide")
+  expect_identical(nrow(wide), fit$n_observations)
+  expect_identical(wide$row, seq_len(fit$n_observations))
+  expect_equal(wide$group, dat$g)
+  group_posteriors <- get_results(fit, "group_posteriors")
+  expect_identical(nrow(group_posteriors),
+                   fit$n_groups * fit$n_group_classes)
+  wide_groups <- get_results(fit, "group_posteriors", format = "wide")
+  expect_identical(nrow(wide_groups), fit$n_groups)
+  expect_equal(sum(wide_groups$group_size), fit$n_observations)
+  expect_equal(sum(wide_groups$log_likelihood), fit$log_likelihood)
+  expect_identical(nrow(get_results(fit, "starts")), 6L)
+  expect_identical(get_results(fit, "information_criteria"),
+                   get_results(fit, "information_criteria"))
+  # and the long shape reaches the verb through the accessor too
+  expect_identical(get_results(fit, "information_criteria", format = "long"),
+                   get_results(fit, "information_criteria", format = "long"))
+  expect_identical(get_results(fit, "entropy"), get_results(fit, "entropy"))
+  expect_identical(get_results(fit, "classification", level = "groups"),
+                   get_results(fit, "classification", level = "groups"))
+})
+
+test_that("enumeration and inference tidy and print", {
+  dat <- make_two_level()
+  candidates <- enumerate_classes(dat, c("a", "b"), "g", n_profiles = 1:2,
+                                 n_group_classes = 1:2, model = NULL, n_starts = 1,
+                                 seed = 3)
+  expect_s3_class(candidates, "multilpa_enumeration")
+  grid <- as.data.frame(candidates)
+  expect_identical(nrow(grid), 4L)
+  expect_true(all(c("sabic_groups", "sabic_individual", "caic_groups",
+                    "caic_individual", "awe_groups", "awe_individual",
+                    "icl_groups", "icl_individual") %in% names(grid)))
+  # A candidate that fails must be retained with NA criteria, not dropped.
+  failed <- subset(grid, !converged)
+  expect_true(all(is.na(failed$sabic_individual)))
+  expect_output(print(candidates), "Class enumeration")
+  fit <- multilpa(dat, c("a", "b"), "g", 2, 2, n_starts = 1, seed = 5)
+  information <- parameter_inference(fit, dat)
+  # The verb returns the tidy table itself; there is no wrapper to unpack.
+  expect_s3_class(information, "data.frame")
+  expect_true(all(c("level", "outcome", "term", "parameter") %in% names(information)))
+  expect_setequal(unique(information$level), c("measurement", "profile", "group"))
+  estimates <- information
+  expect_identical(nrow(estimates), length(coef(fit)))
+  expect_equal(estimates$estimate, unname(coef(fit)))
+  # Means get the symmetric interval; variances and probabilities get it on
+  # the log and logit scales, where it is symmetric instead.
+  z <- stats::qnorm(0.975)
+  kind <- latents:::.multilpa_interval_kind(estimates$parameter, estimates$term,
+                                            c("a", "b"))
+  real <- kind == "real"
+  expect_equal((estimates$conf_high - estimates$conf_low)[real],
+               2 * z * estimates$standard_error[real])
+  probability <- kind == "probability"
+  p <- estimates$estimate[probability]
+  expect_equal(stats::qlogis(estimates$conf_high[probability]) -
+                 stats::qlogis(estimates$conf_low[probability]),
+               2 * z * estimates$standard_error[probability] / (p * (1 - p)))
+  positive <- kind == "positive"
+  v <- estimates$estimate[positive]
+  expect_equal(log(estimates$conf_high[positive]) - log(estimates$conf_low[positive]),
+               2 * z * estimates$standard_error[positive] / v)
+  expect_true(all(estimates$conf_low[probability] > 0 &
+                    estimates$conf_high[probability] < 1))
+  expect_true(all(estimates$conf_low[positive] > 0))
+  # Mixing probabilities are boundary hypotheses and carry no Wald test.
+  expect_true(all(is.na(subset(estimates,
+    grepl("probability", estimates$parameter))$p_value)))
+  expect_false(any(is.na(subset(estimates,
+    grepl("^mean", estimates$parameter))$p_value)))
+  expect_identical(attr(information, "vcov_type"), "observed")
+})
+
+test_that("starting_values round-trips a fitted solution", {
+  dat <- make_two_level()
+  fit <- multilpa(dat, c("a", "b"), "g", 2, 2, n_starts = 6, seed = 5)
+  start <- starting_values(fit)
+  expect_setequal(names(start), c("means", "variances",
+    "profile_probabilities", "group_probabilities"))
+  expect_null(dimnames(start$means))
+  refit <- multilpa(dat, c("a", "b"), "g", 2, 2, start = start, n_starts = 1,
+                      max_iter = 5000, tol = 1e-13)
+  # The fitted solution must be a fixed point of the EM engine.
+  expect_equal(refit$log_likelihood, fit$log_likelihood, tolerance = 1e-9)
+  expect_equal(unname(refit$means), unname(fit$means), tolerance = 1e-6)
+  full <- multilpa(dat, c("a", "b"), "g", 2, 2, covariance_model = "full",
+                     n_starts = 4, seed = 5)
+  full_start <- starting_values(full)
+  expect_true("covariances" %in% names(full_start))
+  expect_null(full_start$variances)
+  expect_false("covariances" %in% names(starting_values(full, covariance = "drop")))
+  expect_equal(dim(starting_values(full, covariance = "drop")$variances), c(2L, 2L))
+})
+
+test_that("starting_values rejects incomplete input by condition class", {
+  expect_error(starting_values(list(means = matrix(0, 2, 2))),
+               class = "latents_bad_start")
+  expect_error(starting_values(list(means = matrix(0, 2, 2),
+    profile_probabilities = matrix(0.5, 1, 2), group_probabilities = 1)),
+    class = "latents_bad_start")
+  expect_error(starting_values(list(means = matrix(0, 2, 2),
+    variances = matrix(1, 2, 2), profile_probabilities = matrix(0.5, 1, 2),
+    group_probabilities = 1), covariance = "keep"),
+    class = "latents_bad_start")
+})
+
+test_that("every result class has a working tidy accessor", {
+  # Rule 0: no result object should make the caller reach in with `$`.
+  set.seed(4)
+  group <- rep(seq_len(30L), each = 10L)
+  n <- length(group)
+  profile <- sample.int(2L, n, replace = TRUE)
+  dat <- data.frame(school = group,
+                    a = stats::rnorm(n, c(-1.5, 1.5)[profile]),
+                    b = stats::rnorm(n, c(-1, 1)[profile]),
+                    age = stats::rnorm(n),
+                    resources = rep(stats::rnorm(30L), each = 10L))
+  covariate_fit <- quietly(multilpa(
+    dat, c("a", "b"), "school", 2, 2, profile_covariates = "age",
+    group_covariates = "resources", n_starts = 1, max_iter = 20, seed = 1))
+  profiles <- as.data.frame(covariate_fit)
+  expect_identical(names(profiles),
+    c("profile", "indicator", "mean", "variance", "standard_deviation",
+      "mean_standard_error", "variance_standard_error"))
+  expect_identical(nrow(profiles), 4L)
+  expect_equal(profiles$standard_deviation, sqrt(profiles$variance))
+  coefficients <- get_results(covariate_fit, "coefficients")
+  expect_identical(names(coefficients),
+    c("level", "outcome", "term", "parameter", "estimate"))
+  # The estimates are multinomial logits; the table has to say so.
+  expect_identical(unique(coefficients$parameter), "logit")
+  expect_setequal(unique(coefficients$level), c("profile", "group"))
+  expect_true("age" %in% coefficients$term)
+  expect_true("resources" %in% coefficients$term)
+  expect_identical(nrow(get_results(covariate_fit, "posteriors")),
+                   n * covariate_fit$n_profiles)
+  expect_identical(nrow(get_results(covariate_fit, "group_posteriors")),
+                   30L * covariate_fit$n_group_classes)
+})
+
+test_that("preparation helpers enforce their own contracts", {
+  # Extracted from multilpa; they must still reject what it used to reject.
+  expect_error(.multilpa_prepare_groups(c(1, NA, 2)), "nonmissing")
+  expect_error(.multilpa_prepare_groups(c(1, Inf, 2)), "nonmissing")
+  expect_error(.multilpa_prepare_groups(list(1, 2)), "nonmissing")
+  groups <- .multilpa_prepare_groups(c("b", "a", "b", "c", "a"))
+  # First-occurrence order, not sorted order.
+  expect_identical(groups$values, c("b", "a", "c"))
+  expect_identical(groups$index, c(1L, 2L, 1L, 3L, 2L))
+  expect_identical(groups$n, 3L)
+  expect_identical(groups$sizes, c(2L, 2L, 1L))
+  dat <- data.frame(g = rep(1:4, each = 3), y = stats::rnorm(12),
+                    u = rep(c(1, 2), 6))
+  prepared <- .multilpa_prepare_indicators(dat, c("y", "u"), "u", "error", 1e-10)
+  expect_identical(prepared$continuous, "y")
+  expect_identical(dim(prepared$x), c(12L, 1L))
+  expect_identical(unname(prepared$n_categories), 2L)
+  # Every indicator categorical leaves a zero-column Gaussian block.
+  all_categorical <- .multilpa_prepare_indicators(dat, "u", "u", "error", 1e-10)
+  expect_identical(dim(all_categorical$x), c(12L, 0L))
+  expect_error(.multilpa_check_arguments(dat, "y", "g", 0, 1, 1, 1, 1e-8, 1e-6,
+                                       1e-10, NULL, character()),
+               "positive integer")
+  expect_error(.multilpa_check_arguments(dat, "y", "g", 2, 1, 1, 1, -1, 1e-6,
+                                       1e-10, NULL, character()),
+               "finite positive")
+  expect_error(.multilpa_check_arguments(dat, "y", "g", 2, 1, 1, 1, 1e-8, 1e-6,
+                                       1e-10, 1.5, character()),
+               class = "latents_bad_argument")
+  # A negative seed is one set.seed() accepts, so it is not refused.
+  expect_no_error(.multilpa_check_arguments(dat, "y", "g", 2, 1, 1, 1, 1e-8, 1e-6,
+                                            1e-10, -1, character()))
+})
+
+test_that("the null-default operator behaves like base %||%", {
+  expect_identical(NULL %||% "fallback", "fallback")
+  expect_identical("value" %||% "fallback", "value")
+  expect_identical(NA %||% "fallback", NA)
+  # A zero-length vector is not NULL and must pass through unchanged.
+  expect_identical(character() %||% "fallback", character())
+})
+
+test_that("extracted covariate and inference helpers keep their contracts", {
+  set.seed(9)
+  group <- rep(seq_len(24L), each = 10L)
+  n <- length(group)
+  profile <- sample.int(2L, n, replace = TRUE)
+  dat <- data.frame(school = group,
+                    a = stats::rnorm(n, c(-1.5, 1.5)[profile]),
+                    b = stats::rnorm(n, c(-1, 1)[profile]),
+                    age = stats::rnorm(n),
+                    resources = rep(stats::rnorm(24L), each = 10L))
+  # Covariate column contracts, previously inline in multilpa().
+  expect_error(.multilpa_cov_check_covariates(dat, "a", character(),
+                                            c("a", "b"), "school"),
+               "distinct from indicators")
+  bad <- dat
+  bad$age[3L] <- NA
+  expect_error(.multilpa_cov_check_covariates(bad, "age", character(),
+                                            c("a", "b"), "school"),
+               "finite numeric")
+  expect_null(.multilpa_cov_check_covariates(dat, "age", "resources",
+                                           c("a", "b"), "school"))
+  first_rows <- match(seq_len(24L), group)
+  designs <- .multilpa_cov_designs(dat, c("a", "b"), "age", "resources",
+                                 first_rows, 2L)
+  expect_identical(dim(designs$x), c(n, 2L))
+  # Centring is a translation: the centred matrix has zero column means.
+  expect_equal(unname(colMeans(designs$x)), c(0, 0))
+  expect_identical(nrow(designs$w), 24L)
+  expect_identical(colnames(designs$w), c("(Intercept)", "resources"))
+  expect_identical(nrow(designs$stacked_design), n * 2L)
+  collinear <- dat
+  collinear$copy <- collinear$age
+  expect_error(.multilpa_cov_designs(collinear, c("a", "b"), c("age", "copy"),
+                                   character(), first_rows, 2L),
+               "rank deficient")
+
+  # Inference contracts, previously inline in parameter_inference().
+  fit <- multilpa(dat, c("a", "b"), "school", 2, 2, n_starts = 1, seed = 1)
+  prepared <- .multilpa_inference_matrix(fit, dat)
+  expect_identical(dim(prepared$x), c(n, 2L))
+  expect_equal(unname(colMeans(prepared$x)), c(0, 0))
+  expect_equal(prepared$centers, colMeans(as.matrix(dat[, c("a", "b")])))
+  expect_error(.multilpa_inference_matrix(fit, dat[-1L, ]), "original numeric")
+  shuffled <- dat[c(2L, 1L, seq(3L, n)), ]
+  expect_error(.multilpa_inference_matrix(fit, shuffled), "row order")
+  expect_null(.multilpa_check_regularity(fit, "observed"))
+  unconverged <- fit
+  unconverged$converged <- FALSE
+  expect_error(.multilpa_check_regularity(unconverged, "observed"), "converged fit")
+  bounded <- fit
+  bounded$boundary <- TRUE
+  expect_error(.multilpa_check_regularity(bounded, "observed"), "bound-active")
+  # Categorical measurement is no longer refused; only the genuine regularity
+  # failures below are.
+  categorical <- fit
+  categorical$response_probabilities <- list(matrix(0.5, 2L, 2L))
+  expect_null(.multilpa_check_regularity(categorical, "observed"))
+
+  # A singular information matrix must be refused, not inverted.
+  flat <- function(displacement) 0
+  flat_gradient <- function(displacement) rep(0, length(displacement))
+  expect_error(.multilpa_observed_hessian(flat, flat_gradient, c(1, 1), 1e-4),
+               "positive definite")
+})
